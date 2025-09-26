@@ -1,5 +1,5 @@
 import pygame, os, re
-from screens.learn import LearnPage
+from screens.explore import ExplorePage
 from screens.challenge import ChallengePage
 
 class LandingPage:
@@ -47,7 +47,7 @@ class LandingPage:
     def handle_event(self, event):
         if event.type == pygame.MOUSEBUTTONDOWN:
             if self.learn_button.collidepoint(event.pos):
-                self.set_screen(LearnPage(self.screen, self.set_screen))
+                self.set_screen(ExplorePage(self.screen, self.set_screen))
             elif self.challenge_button.collidepoint(event.pos):
                 self.set_screen(ChallengePage(self.screen, self.set_screen))
 

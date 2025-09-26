@@ -1,7 +1,7 @@
 import pygame
 import sys
 from screens.landing import LandingPage
-from screens.learn import LearnPage
+from screens.explore import ExplorePage
 from screens.challenge import ChallengePage
 
 # Initialize pygame

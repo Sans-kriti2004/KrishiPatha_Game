@@ -160,7 +160,9 @@ class Level2:
                     webbrowser.open("https://agriwelfare.gov.in/")
                     return
                 if self.next_level_button_rect.collidepoint(x, y):
-                    print("Next level button clicked - implement level transition")
+                    if self.set_screen:
+                        from screens.levels.level2 import Level2  # adapt this path to your project
+                        self.set_screen(Level2(self.screen, self.set_screen))
                     return
 
             elif self.state == self.STATE_QUIZ and not self.feedback_pending:
@@ -211,7 +213,9 @@ class Level2:
 
         elif self.state == self.STATE_QUIZ:
             question = self.questions[self.current_question]
-            self.draw_text(f"Q{self.current_question + 1}: {question['q']}", 60, 30)
+            question_rect = pygame.Rect(60, 30, 700, 100)  # width and height to contain question text nicely
+            self.draw_wrapped_text(f"Q{self.current_question + 1}: {question['q']}", question_rect, self.BLACK)
+
             for i, option in enumerate(question["options"]):
                 self.draw_button(option, pygame.Rect(150, 150 + i * 90, 600, 70), self.LIGHT_GREEN)
             pygame.draw.line(self.screen, self.BLACK, (50, 120), (750, 120), 2)

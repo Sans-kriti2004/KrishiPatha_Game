@@ -1,18 +1,26 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
+from ml_models.yield_model import predict_yield
 
 router = APIRouter()
 
-class YieldInput(BaseModel):
-    area: float
+class SimulationRequest(BaseModel):
     crop: str
+    livestock: str
+    water_amount: str
+    irrigation: str
+    soil: str
+    temp: float
+    rainfall: float
 
-@router.post("/yield")
-def predict_yield(data: YieldInput):
-    # mock response for now
-    return {
-        "crop": data.crop,
-        "area": data.area,
-        "predicted_yield": 2500,  # placeholder
-        "ndvi_score": 0.82
-    }
+class SimulationResponse(BaseModel):
+    yield_value: float
+    score: float
+
+@router.post("/simulate", response_model=SimulationResponse)
+async def simulate_farm(req: SimulationRequest):
+    """
+    Simulates yield prediction via ML model
+    """
+    result = predict_yield(req.dict())
+    return SimulationResponse(**result)

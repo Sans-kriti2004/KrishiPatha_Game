@@ -1,33 +1,26 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
-from services import crop_service, livestock_service, fertilizer_service, water_service, yield_service
+from ml_models.environment_model import get_environment_prediction
 
 router = APIRouter()
 
-class LocationInput(BaseModel):
-    lat: float
-    lon: float
+class LocationRequest(BaseModel):
+    latitude: float
+    longitude: float
 
-@router.post("/location")
-def analyze_location(data: LocationInput):
-    # mock env data (replace later with real ML)
-    env = {"soil": "loamy", "rainfall": 700, "temperature": 25}
-    
-    crops = crop_service.recommend(env)
-    livestock = livestock_service.recommend(env)
-    fertilizer = fertilizer_service.recommend(env, ph=6.5)
-    water = water_service.predict(env)
-    yield_pred, ndvi = yield_service.predict(env)
-    
-    return {
-        "location": {"lat": data.lat, "lon": data.lon},
-        "environment": env,
-        "recommendations": {
-            "crops": crops,
-            "livestock": livestock,
-            "fertilizer": fertilizer,
-            "water": water,
-            "yield_prediction": yield_pred,
-            "ndvi_score": ndvi
-        }
-    }
+class EnvironmentResponse(BaseModel):
+    soil: str
+    avg_rainfall: float
+    avg_temp: float
+    water_source: str
+    recommended_crops: list[str]
+    recommended_livestock: list[str]
+
+@router.post("/environment", response_model=EnvironmentResponse)
+async def analyze_environment(req: LocationRequest):
+    """
+    Endpoint: /analyze/environment
+    Fetches real or simulated environment analysis from ML model
+    """
+    data = get_environment_prediction(req.latitude, req.longitude)
+    return EnvironmentResponse(**data)

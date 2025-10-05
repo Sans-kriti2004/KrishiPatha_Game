@@ -1,13 +1,91 @@
+import requests
+from io import BytesIO
+from PIL import Image
 import pygame
 import os
 import math
 import json
 import time
 
+
+# ---- Tiny Web Mercator tile engine for Pygame ----
+TILE_SIZE = 256
+
+_session = requests.Session()
+_headers = {"User-Agent": "KrishiPathaGame/1.0 (educational demo)"}
+_tile_cache = {}  # (z,x,y) -> pygame.Surface
+
+def latlon_to_pixel(lat, lon, z, tile_size=TILE_SIZE):
+    lat = max(min(lat, 85.05112878), -85.05112878)  # Web Mercator clamp
+    scale = (2 ** z) * tile_size
+    x = (lon + 180.0) / 360.0 * scale
+    siny = math.sin(math.radians(lat))
+    y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * scale
+    return x, y
+
+def pixel_to_latlon(px, py, z, tile_size=TILE_SIZE):
+    scale = (2 ** z) * tile_size
+    lon = px / scale * 360.0 - 180.0
+    n = math.pi - 2.0 * math.pi * (py / scale - 0.5)
+    lat = math.degrees(math.atan(math.sinh(n)))
+    return lat, lon
+
+def _fetch_tile(z, x, y):
+    key = (z, x, y)
+    if key in _tile_cache:
+        return _tile_cache[key]
+    # NOTE: Use the standard OSM tile server sparingly.
+    # For production: use MapTiler/Mapbox/Stadia with an API key.
+    url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    try:
+        resp = _session.get(url, headers=_headers, timeout=8)
+        if resp.status_code == 200:
+            img = Image.open(BytesIO(resp.content)).convert("RGB")
+            surf = pygame.image.fromstring(img.tobytes(), img.size, img.mode)
+            _tile_cache[key] = surf
+            return surf
+    except Exception as e:
+        print("Tile fetch error:", e)
+    return None
+
+def draw_webmap(surface, rect, center_lat, center_lon, zoom):
+    """Draws OpenStreetMap tiles covering the given rect centered at (lat, lon)."""
+    surface.set_clip(rect)
+    surface.fill((180, 210, 230), rect)  # light-blue placeholder background
+
+    cx, cy = latlon_to_pixel(center_lat, center_lon, zoom)
+    left = cx - rect.w / 2
+    top = cy - rect.h / 2
+
+    start_tx = int(math.floor(left / TILE_SIZE))
+    end_tx = int(math.floor((left + rect.w) / TILE_SIZE))
+    start_ty = int(math.floor(top / TILE_SIZE))
+    end_ty = int(math.floor((top + rect.h) / TILE_SIZE))
+
+    max_tile_index = 2 ** zoom
+    for ty in range(start_ty, end_ty + 1):
+        for tx in range(start_tx, end_tx + 1):
+            # Wrap X (longitude direction)
+            x_wrap = tx % max_tile_index
+            if ty < 0 or ty >= max_tile_index:
+                continue
+
+            tile = _fetch_tile(zoom, x_wrap, ty)
+            dest_x = rect.x + int(tx * TILE_SIZE - left)
+            dest_y = rect.y + int(ty * TILE_SIZE - top)
+
+            if tile:
+                surface.blit(tile, (dest_x, dest_y))
+            else:
+                pygame.draw.rect(surface, (66, 99, 66),
+                                 pygame.Rect(dest_x, dest_y, TILE_SIZE, TILE_SIZE))
+
+    surface.set_clip(None)
+
+
 pygame.font.init()
 
 # ---------- Simulated datasets & simple recommendation logic ----------
-# Replace these with actual dataset loads or API calls.
 SAMPLE_ENVIRONMENTS = {
     "default": {"soil": "loamy", "avg_rainfall": 700, "avg_temp": 25, "water_source": "river"},
     "new delhi": {"soil": "sandy", "avg_rainfall": 600, "avg_temp": 30, "water_source": "tube well"},
@@ -27,9 +105,7 @@ SAMPLE_LIVESTOCK = [
     {"name": "Chicken", "climate_tolerance": (0, 40), "feed_needs": "low"}
 ]
 
-
 def recommend_crops(env):
-    """Simple scoring-based recommendation (placeholder for ML)."""
     soil = env.get("soil")
     temp = env.get("avg_temp", 25)
     recs = []
@@ -37,16 +113,13 @@ def recommend_crops(env):
         score = 0
         if soil in c["soils"]:
             score += 30
-        # temperature match
         if c["min_temp"] <= temp <= c["max_temp"]:
             score += 30
-        # lower water need preferred in drought
         wf = {"low": 20, "medium": 10, "high": 0}
         score += wf.get(c["water_need"], 0)
         recs.append((score, c))
     recs.sort(reverse=True, key=lambda x: x[0])
     return [c for _, c in recs[:3]]
-
 
 def recommend_livestock(env):
     temp = env.get("avg_temp", 25)
@@ -62,13 +135,11 @@ def recommend_livestock(env):
     recs.sort(reverse=True, key=lambda x: x[0])
     return [a for _, a in recs[:2]]
 
-
 # ---------- Helper UI utilities ----------
 def draw_text(surface, text, font, color, pos):
     surf = font.render(text, True, color)
     surface.blit(surf, pos)
     return surf.get_rect(topleft=pos)
-
 
 def center_text(surface, text, font, color, rect):
     surf = font.render(text, True, color)
@@ -76,17 +147,47 @@ def center_text(surface, text, font, color, rect):
     surface.blit(surf, pos)
     return surf.get_rect(topleft=pos)
 
-
-# small helper to clamp a point inside a rect with margin
 def clamp_point_to_rect(pt, rect, margin=6):
     x = max(rect.left + margin, min(int(pt[0]), rect.right - margin))
     y = max(rect.top + margin, min(int(pt[1]), rect.bottom - margin))
     return (x, y)
 
+def get_map_surface(lat, lon, zoom=13, size=(600, 400)):
+    """Fetch a static map from OpenStreetMap tiles and return as Pygame Surface."""
+
+    # OSM tile math
+    import math
+    def deg2num(lat_deg, lon_deg, zoom):
+        lat_rad = math.radians(lat_deg)
+        n = 2.0 ** zoom
+        xtile = int((lon_deg + 180.0) / 360.0 * n)
+        ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+        return (xtile, ytile)
+
+    # Pick the center tile
+    xtile, ytile = deg2num(lat, lon, zoom)
+
+    # Build the URL (OpenStreetMap tile server)
+    url = f"https://a.tile.openstreetmap.fr/osmfr/{zoom}/{xtile}/{ytile}.png"
+    headers = {"User-Agent": "KrishiPathaGame/1.0 (Educational project)"}
+    #resp = requests.get(url, headers=headers, timeout=10)
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            img = Image.open(BytesIO(resp.content)).convert("RGB")
+            # Scale tile to requested size
+            img = img.resize(size)
+            return pygame.image.fromstring(img.tobytes(), img.size, img.mode)
+        else:
+            print("Failed to load OSM tile:", resp.status_code)
+            return None
+    except Exception as e:
+        print("Error loading OSM tile:", e)
+        return None
+
 
 # ---------- Screens ----------
 class ExplorePage:
-    """Initial entry screen for Explore Mode."""
     def __init__(self, screen, set_screen):
         self.screen = screen
         self.set_screen = set_screen
@@ -101,30 +202,24 @@ class ExplorePage:
             if self.start_btn.collidepoint(event.pos):
                 self.set_screen(ExploreMap(self.screen, self.set_screen))
 
-    def update(self):
-        pass
+    def update(self): pass
 
     def draw(self):
         self.screen.fill((28, 58, 45))
         draw_text(self.screen, "Explore Mode — Real-time Farm Planner", self.title_font, (255, 255, 255), (40, 40))
         y = 100
-        bullets = [
+        for b in [
             "Select a location (type or click).",
             "Draw your field plot on the map.",
             "Get crop & livestock recommendations based on environment.",
             "Learn stage-by-stage farming & sustainability tips."
-        ]
-        for b in bullets:
+        ]:
             draw_text(self.screen, "• " + b, self.text_font, (220, 220, 220), (60, y))
             y += 36
-
-        # Start button
         pygame.draw.rect(self.screen, (40, 160, 100), self.start_btn, border_radius=10)
         center_text(self.screen, "Start Explore", self.text_font, (255, 255, 255), self.start_btn)
 
-
 class ExploreMap:
-    """Map-like interface where user picks a location by typing or clicking."""
     def __init__(self, screen, set_screen):
         self.screen = screen
         self.set_screen = set_screen
@@ -132,105 +227,173 @@ class ExploreMap:
         self.title_font = pygame.font.SysFont("Arial", 28, bold=True)
         self.text_font = pygame.font.SysFont("Arial", 18)
         self.small_font = pygame.font.SysFont("Arial", 16)
-        
-        # simple placeholder 'map' (we use blank background) — replace with tile or static map image
         self.map_rect = pygame.Rect(40, 100, self.W - 80, self.H - 220)
-
-        # location input
         self.input_active = False
-        self.input_rect = pygame.Rect(60, 40, 360, 36)
+        self.input_rect = pygame.Rect(60, 50, 360, 36)
         self.input_text = ""
         self.hint = "Type a location name (e.g. 'New Delhi') or click on map"
-
-        # last clicked coordinate on "map" (in map-space)
         self.clicked_point = None
-
-        # proceed button
         self.next_btn = pygame.Rect(self.W - 200, self.H - 70, 160, 48)
-
-        # sample env chosen
         self.env = SAMPLE_ENVIRONMENTS["default"]
+        self.map_surface = None
+        self.center_lat, self.center_lon = (28.6139, 77.2090)  # New Delhi
+        self.zoom = 12
+        self.is_dragging = False
+        self.drag_start = None  # (mouse_x, mouse_y)
+        self.drag_center_px = None  # (global_px, global_py) snapshot at start
+
+
 
     def handle_event(self, event):
         if event.type == pygame.MOUSEBUTTONDOWN:
+            # ✅ Handle text input focus separately
             if self.input_rect.collidepoint(event.pos):
                 self.input_active = True
+                self.is_dragging = False
+                return
             else:
                 self.input_active = False
 
+            # ✅ Handle map dragging only when not typing
             if self.map_rect.collidepoint(event.pos):
-                # click -> set clicked_point
-                mx, my = event.pos
-                # normalize to map coords or just store pixel coords
-                # clamp the clicked point inside the map area (visual safety)
-                self.clicked_point = clamp_point_to_rect((mx, my), self.map_rect, margin=6)
+                self.is_dragging = True
+                self.drag_start = event.pos
+                self.drag_center_px = latlon_to_pixel(self.center_lat, self.center_lon, self.zoom)
 
-                # set env detection by clicking -> simulate env by snapping to a name
-                cx = mx - self.map_rect.x
-                if cx < (self.map_rect.w // 2):
+                # Optional: click also sets environment preview
+                mx, my = event.pos
+                self.clicked_point = clamp_point_to_rect((mx, my), self.map_rect, margin=6)
+                if mx - self.map_rect.x < (self.map_rect.w // 2):
                     self.env = SAMPLE_ENVIRONMENTS.get("up farm")
                 else:
                     self.env = SAMPLE_ENVIRONMENTS.get("new delhi")
+
+            # ✅ Handle next button separately
             if self.next_btn.collidepoint(event.pos):
-                # finalize: if typed location, try to map; else use clicked_point
                 loc_key = self.input_text.strip().lower()
-                env = SAMPLE_ENVIRONMENTS.get(loc_key)
-                if env:
-                    self.env = env
-                # pass environment and clicked_point to next screen
-                # clicked_point may be None -> ExplorePlot handles None
-                self.set_screen(ExplorePlot(self.screen, self.set_screen, env=self.env, start_point=self.clicked_point))
+                env = SAMPLE_ENVIRONMENTS.get(loc_key, SAMPLE_ENVIRONMENTS["default"])
+                self.env = env
+
+                if loc_key == "new delhi":
+                    self.center_lat, self.center_lon = (28.6139, 77.2090)
+                elif loc_key == "up farm":
+                    self.center_lat, self.center_lon = (26.8467, 80.9462)
+                else:
+                    self.center_lat, self.center_lon = (25.0, 80.0)
+
+                self.set_screen(ExplorePlot(
+                    self.screen, self.set_screen,
+                    env=self.env,
+                    start_point=self.clicked_point,
+                    center=(self.center_lat, self.center_lon),
+                    zoom=self.zoom
+                ))
+
+        elif event.type == pygame.MOUSEBUTTONUP:
+            self.is_dragging = False
+
+        elif event.type == pygame.MOUSEMOTION and self.is_dragging:
+            # ✅ Proper delta-based map pan
+            dx = event.pos[0] - self.drag_start[0]
+            dy = event.pos[1] - self.drag_start[1]
+            start_px, start_py = self.drag_center_px
+            new_px = start_px - dx
+            new_py = start_py - dy
+            self.center_lat, self.center_lon = pixel_to_latlon(new_px, new_py, self.zoom)
+
+        elif event.type == pygame.MOUSEWHEEL:
+            mouse_x, mouse_y = pygame.mouse.get_pos()
+            if self.map_rect.collidepoint((mouse_x, mouse_y)):
+                old_zoom = self.zoom
+                new_zoom = max(2, min(18, old_zoom + (1 if event.y > 0 else -1)))
+                if new_zoom != old_zoom:
+                    # Current center in pixel coords (old zoom)
+                    cx, cy = latlon_to_pixel(self.center_lat, self.center_lon, old_zoom)
+
+                    # Mouse position relative to map rect
+                    rel_x = mouse_x - self.map_rect.x
+                    rel_y = mouse_y - self.map_rect.y
+
+                    # Global pixel under cursor at old zoom
+                    cursor_global_x = cx - (self.map_rect.w / 2) + rel_x
+                    cursor_global_y = cy - (self.map_rect.h / 2) + rel_y
+
+                    # Convert that pixel to lat/lon
+                    lat_under_cursor, lon_under_cursor = pixel_to_latlon(cursor_global_x, cursor_global_y, old_zoom)
+
+                    # Convert back to pixels at new zoom
+                    new_cursor_px, new_cursor_py = latlon_to_pixel(lat_under_cursor, lon_under_cursor, new_zoom)
+
+                    # Adjust map center so that cursor stays fixed visually
+                    new_center_x = new_cursor_px - (rel_x - self.map_rect.w / 2)
+                    new_center_y = new_cursor_py - (rel_y - self.map_rect.h / 2)
+
+                    self.center_lat, self.center_lon = pixel_to_latlon(new_center_x, new_center_y, new_zoom)
+                    self.zoom = new_zoom
 
         elif event.type == pygame.KEYDOWN and self.input_active:
             if event.key == pygame.K_BACKSPACE:
                 self.input_text = self.input_text[:-1]
             elif event.key == pygame.K_RETURN:
-                # same as pressing Next
                 loc_key = self.input_text.strip().lower()
-                env = SAMPLE_ENVIRONMENTS.get(loc_key, SAMPLE_ENVIRONMENTS["default"])
-                self.env = env
-                self.set_screen(ExplorePlot(self.screen, self.set_screen, env=self.env, start_point=self.clicked_point))
+                self.env = SAMPLE_ENVIRONMENTS.get(loc_key, SAMPLE_ENVIRONMENTS["default"])
+                if loc_key == "new delhi":
+                    self.center_lat, self.center_lon = (28.6139, 77.2090)
+                elif loc_key == "up farm":
+                    self.center_lat, self.center_lon = (26.8467, 80.9462)
+                else:
+                    self.center_lat, self.center_lon = (25.0, 80.0)
+
+                self.set_screen(ExplorePlot(
+                    self.screen, self.set_screen,
+                    env=self.env,
+                    start_point=self.clicked_point,
+                    center=(self.center_lat, self.center_lon),
+                    zoom=self.zoom
+                ))
             else:
                 if len(self.input_text) < 50:
                     self.input_text += event.unicode
 
-    def update(self):
-        pass
+    def update(self): pass
 
     def draw(self):
         self.screen.fill((18, 40, 26))
         draw_text(self.screen, "Select Location on Map", self.title_font, (255, 255, 255), (40, 16))
-
-        # input box
         pygame.draw.rect(self.screen, (255, 255, 255), self.input_rect, border_radius=6)
+        
+        # Optional: smoother tile loading feedback in window title
+        if not _tile_cache:
+            pygame.display.set_caption("⏳ Loading map tiles...")
+        else:
+            pygame.display.set_caption("KrishiPatha — Explore Mode")
+
         txt = self.input_text if self.input_text else self.hint
         color = (0, 0, 0) if self.input_text else (120, 120, 120)
         draw_text(self.screen, txt, self.text_font, color, (self.input_rect.x + 8, self.input_rect.y + 6))
 
-        # draw map area
-        pygame.draw.rect(self.screen, (80, 120, 80), self.map_rect)
-        # draw a faint grid for feel
-        for x in range(self.map_rect.left, self.map_rect.right, 60):
-            pygame.draw.line(self.screen, (70, 100, 70), (x, self.map_rect.top), (x, self.map_rect.bottom))
-        for y in range(self.map_rect.top, self.map_rect.bottom, 60):
-            pygame.draw.line(self.screen, (70, 100, 70), (self.map_rect.left, y), (self.map_rect.right, y))
-        # show clicked point
+        # blinking cursor if active
+        if self.input_active and pygame.time.get_ticks() % 1000 < 500:
+            cursor_x = self.input_rect.x + 8 + self.text_font.size(self.input_text)[0] + 2
+            pygame.draw.line(self.screen, (0, 0, 0),
+                            (cursor_x, self.input_rect.y + 6),
+                            (cursor_x, self.input_rect.y + self.input_rect.h - 6), 2)
+        
+        # draw map
+        draw_webmap(self.screen, self.map_rect, self.center_lat, self.center_lon, self.zoom)
+
         if self.clicked_point:
             pygame.draw.circle(self.screen, (255, 220, 60), self.clicked_point, 8)
-            draw_text(self.screen, "Selected point", self.small_font, (255, 255, 255), (self.clicked_point[0] + 10, self.clicked_point[1] - 8))
-
-        # env summary
-        draw_text(self.screen, "Detected environment:", self.text_font, (220, 220, 220), (self.map_rect.left + 8, self.map_rect.bottom + 10))
-        draw_text(self.screen, f"Soil: {self.env['soil']}, Rainfall: {self.env['avg_rainfall']} mm, Temp: {self.env['avg_temp']}°C", self.small_font, (210, 210, 210), (self.map_rect.left + 8, self.map_rect.bottom + 36))
-
-        # Next button
+        
+        draw_text(self.screen,
+            f"Soil: {self.env['soil']}, Rainfall: {self.env['avg_rainfall']} mm, Temp: {self.env['avg_temp']}°C",
+            self.small_font, (210, 210, 210),
+            (self.map_rect.left + 8, self.map_rect.bottom + 36))
         pygame.draw.rect(self.screen, (30, 140, 100), self.next_btn, border_radius=8)
         center_text(self.screen, "Plot Field", self.text_font, (255, 255, 255), self.next_btn)
 
-
 class ExplorePlot:
-    """Allow user to draw a polygon plot on the map area (click to add vertices)."""
-    def __init__(self, screen, set_screen, env=None, start_point=None):
+    def __init__(self, screen, set_screen, env=None, start_point=None, center=None, zoom=12):
         self.screen = screen
         self.set_screen = set_screen
         self.env = env or SAMPLE_ENVIRONMENTS["default"]
@@ -238,165 +401,288 @@ class ExplorePlot:
         self.title_font = pygame.font.SysFont("Arial", 28, bold=True)
         self.small_font = pygame.font.SysFont("Arial", 16)
         self.map_rect = pygame.Rect(40, 100, self.W - 80, self.H - 220)
-        self.points = []
-        self.is_finished = False
-        # clamp and add start point if provided
-        if start_point:
-            self.points.append(clamp_point_to_rect(start_point, self.map_rect, margin=6))
+        self.points, self.is_finished = [], False
+        if start_point: self.points.append(clamp_point_to_rect(start_point, self.map_rect, margin=6))
         self.finish_btn = pygame.Rect(self.W - 220, self.H - 70, 180, 48)
         self.cancel_btn = pygame.Rect(self.W - 420, self.H - 70, 180, 48)
+        self.center_lat, self.center_lon = center or (28.6139, 77.2090)
+        self.zoom = zoom
+        self.is_dragging = False
+        self.drag_start = None
+        self.drag_center_px = None
 
     def handle_event(self, event):
         if event.type == pygame.MOUSEBUTTONDOWN:
             if self.finish_btn.collidepoint(event.pos) and len(self.points) >= 3:
-                # compute simple polygon, finalize and proceed
                 self.is_finished = True
-                # send polygon (pixel coords) and env to next stage
-                self.set_screen(ExploreStageLearning(self.screen, self.set_screen, env=self.env, polygon=self.points))
-                return
-            if self.cancel_btn.collidepoint(event.pos):
+                self.set_screen(ExploreStageLearning(
+                    self.screen, self.set_screen,
+                    env=self.env,
+                    polygon=self.points,
+                    center=(self.center_lat, self.center_lon),
+                    zoom=self.zoom
+                ))
+            elif self.cancel_btn.collidepoint(event.pos):
                 self.set_screen(ExploreMap(self.screen, self.set_screen))
-                return
+            elif self.map_rect.collidepoint(event.pos) and not self.is_finished:
+                # ✅ Start drag only if not plotting
+                if pygame.key.get_mods() & pygame.KMOD_CTRL:
+                    self.is_dragging = True
+                    self.drag_start = event.pos
+                    self.drag_center_px = latlon_to_pixel(self.center_lat, self.center_lon, self.zoom)
+                else:
+                    # Normal click adds a vertex
+                    mx = max(self.map_rect.left + 6, min(event.pos[0], self.map_rect.right - 6))
+                    my = max(self.map_rect.top + 6, min(event.pos[1], self.map_rect.bottom - 6))
+                    self.points.append((mx, my))
 
-            if self.map_rect.collidepoint(event.pos) and not self.is_finished:
-                # clamp point inside map_rect (prevents plotting outside)
-                mx = max(self.map_rect.left + 6, min(event.pos[0], self.map_rect.right - 6))
-                my = max(self.map_rect.top + 6, min(event.pos[1], self.map_rect.bottom - 6))
-                self.points.append((mx, my))
+        elif event.type == pygame.MOUSEBUTTONUP:
+            self.is_dragging = False
+
+        elif event.type == pygame.MOUSEMOTION and self.is_dragging:
+            dx = event.pos[0] - self.drag_start[0]
+            dy = event.pos[1] - self.drag_start[1]
+            start_px, start_py = self.drag_center_px
+            new_px = start_px - dx
+            new_py = start_py - dy
+            self.center_lat, self.center_lon = pixel_to_latlon(new_px, new_py, self.zoom)
+
+        elif event.type == pygame.MOUSEWHEEL:
+            mouse_x, mouse_y = pygame.mouse.get_pos()
+            if self.map_rect.collidepoint((mouse_x, mouse_y)):
+                old_zoom = self.zoom
+                new_zoom = max(2, min(18, old_zoom + (1 if event.y > 0 else -1)))
+                if new_zoom != old_zoom:
+                    # Current center in pixel coords (old zoom)
+                    cx, cy = latlon_to_pixel(self.center_lat, self.center_lon, old_zoom)
+
+                    # Mouse position relative to map rect
+                    rel_x = mouse_x - self.map_rect.x
+                    rel_y = mouse_y - self.map_rect.y
+
+                    # Global pixel under cursor at old zoom
+                    cursor_global_x = cx - (self.map_rect.w / 2) + rel_x
+                    cursor_global_y = cy - (self.map_rect.h / 2) + rel_y
+
+                    # Convert that pixel to lat/lon
+                    lat_under_cursor, lon_under_cursor = pixel_to_latlon(cursor_global_x, cursor_global_y, old_zoom)
+
+                    # Convert back to pixels at new zoom
+                    new_cursor_px, new_cursor_py = latlon_to_pixel(lat_under_cursor, lon_under_cursor, new_zoom)
+
+                    # Adjust map center so that cursor stays fixed visually
+                    new_center_x = new_cursor_px - (rel_x - self.map_rect.w / 2)
+                    new_center_y = new_cursor_py - (rel_y - self.map_rect.h / 2)
+
+                    self.center_lat, self.center_lon = pixel_to_latlon(new_center_x, new_center_y, new_zoom)
+                    self.zoom = new_zoom
 
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_RETURN and len(self.points) >= 3:
-                self.set_screen(ExploreStageLearning(self.screen, self.set_screen, env=self.env, polygon=self.points))
-            if event.key == pygame.K_BACKSPACE and self.points:
+                self.set_screen(ExploreStageLearning(
+                    self.screen, self.set_screen,
+                    env=self.env,
+                    polygon=self.points,
+                    center=(self.center_lat, self.center_lon),
+                    zoom=self.zoom
+                ))
+            elif event.key == pygame.K_BACKSPACE and self.points:
                 self.points.pop()
 
-    def update(self):
-        pass
+    def update(self): pass
 
     def draw(self):
         self.screen.fill((14, 40, 22))
-        draw_text(self.screen, "Draw your plot: click to add vertices (Enter to finish, Backspace to undo)", self.title_font, (255, 255, 255), (40, 20))
-        # map area
-        pygame.draw.rect(self.screen, (55, 95, 55), self.map_rect)
-        # draw partial polygon
+        draw_text(self.screen, 
+                "Draw your plot: click to add vertices (Enter to finish, Backspace to undo)",
+                self.title_font, (255, 255, 255), (40, 20))
         
-        # Draw field outline if enough points exist
+        # Optional: smoother tile loading feedback in window title
+        if not _tile_cache:
+            pygame.display.set_caption("⏳ Loading map tiles...")
+        else:
+            pygame.display.set_caption("KrishiPatha — Explore Mode")
+
+        # 🔹 Show map if available
+        draw_webmap(self.screen, self.map_rect, self.center_lat, self.center_lon, self.zoom)
+        # then draw polygon vertices/lines as you already do
+
+        # 🔹 Draw polygon lines on top
         if len(self.points) >= 2:
             pygame.draw.lines(self.screen, (150, 210, 150), False, self.points, 4)
-        # Draw the points themselves
         for p in self.points:
             pygame.draw.circle(self.screen, (0, 200, 0), p, 6)
 
-        # show simple centroid area estimate and info
-        if len(self.points) >= 3:
-            # compute polygon area (shoelace) - for display
-            area = abs(sum(self.points[i][0] * self.points[(i + 1) % len(self.points)][1] - self.points[(i + 1) % len(self.points)][0] * self.points[i][1] for i in range(len(self.points)))) / 2.0
-            draw_text(self.screen, f"Plot area (pixel units): {int(area)}", self.small_font, (230, 230, 230), (self.map_rect.left + 8, self.map_rect.top + 8))
-        # buttons
-        pygame.draw.rect(self.screen, (180, 60, 60), self.cancel_btn, border_radius=8)
-        center_text(self.screen, "Back", self.small_font, (255, 255, 255), self.cancel_btn)
-        pygame.draw.rect(self.screen, (30, 140, 80), self.finish_btn, border_radius=8)
-        center_text(self.screen, "Confirm Plot", self.small_font, (255, 255, 255), self.finish_btn)
+        # 🔹 Draw buttons
+        pygame.draw.rect(self.screen, (30, 140, 100), self.finish_btn, border_radius=6)
+        center_text(self.screen, "Finish Plot", self.small_font, (255, 255, 255), self.finish_btn)
 
+        pygame.draw.rect(self.screen, (160, 60, 60), self.cancel_btn, border_radius=6)
+        center_text(self.screen, "Cancel", self.small_font, (255, 255, 255), self.cancel_btn)
+        
 
 class ExploreStageLearning:
-    """Main interactive stage:
-    - shows the planted plot
-    - recommends crops & livestock
-    - user picks options stage-by-stage
-    - includes a small chat assistant panel
-    """
-    def __init__(self, screen, set_screen, env=None, polygon=None):
+    def __init__(self, screen, set_screen, env=None, polygon=None, center=None, zoom=12):
         self.screen = screen
         self.set_screen = set_screen
         self.W, self.H = screen.get_size()
         self.env = env or SAMPLE_ENVIRONMENTS["default"]
 
-        # layout
-        self.map_rect = pygame.Rect(40, 100, int(self.W * 0.62), self.H - 160)
-        self.side_rect = pygame.Rect(self.map_rect.right + 12, 100,
-                                     self.W - self.map_rect.right - 52, self.map_rect.h)
+        self.map_rect = pygame.Rect(40, 100, int(self.W * 0.60), self.H - 160)
+        self.side_rect = pygame.Rect(self.map_rect.right + 30, 100, self.W - self.map_rect.right - 70, self.map_rect.h)
 
-        # clamp polygon
-        self.polygon = [clamp_point_to_rect(p, self.map_rect, 6) for p in (polygon or [])]
+        self.polygon = [clamp_point_to_rect(p, self.map_rect, margin=6) for p in (polygon or [])]
 
-        # fonts
         self.title_font = pygame.font.SysFont("Arial", 26, bold=True)
         self.text_font = pygame.font.SysFont("Arial", 18)
         self.small_font = pygame.font.SysFont("Arial", 14)
 
-        # recommendations
         self.crops_reco = recommend_crops(self.env)
         self.livestock_reco = recommend_livestock(self.env)
 
-        # explanations
         self.reco_explanations = {
-            "Wheat": "Wheat grows well in loamy and clay soils, tolerates moderate temperatures and needs medium water. Recommended for steady yields.",
-            "Millet": "Millet is drought-tolerant, does well in sandy or loamy soils and requires low water. Good for dry conditions.",
-            "Rice": "Rice prefers clay soils and high water; expect high water usage and high yield where water is available.",
-            "Maize": "Maize likes loamy soils and warm weather; yields depend on timely irrigation."
+            "Wheat": "Wheat grows well in loamy and clay soils, tolerates moderate temperatures and needs medium water.",
+            "Millet": "Millet is drought-tolerant, grows in sandy or loamy soils and requires low water.",
+            "Rice": "Rice prefers clay soils and high water; gives high yield where water is abundant.",
+            "Maize": "Maize likes loamy soils and warm weather; needs timely irrigation."
         }
         self.livestock_explanations = {
-            "Goat": "Goats are low-feed, hardy animals suitable for small holdings and dry areas.",
-            "Cow": "Cows require higher feed but give milk and other outputs; need more care and water.",
-            "Chicken": "Chickens are low-feed, quick-turn animals giving eggs and meat; simple housing needed."
+            "Goat": "Goats are hardy, low-feed animals suitable for dry areas.",
+            "Cow": "Cows require higher feed but give milk and other outputs.",
+            "Chicken": "Chickens are low-feed, quick-turn animals giving eggs and meat."
         }
 
-        # stages
-        self.stages = ["irrigation", "soil", "allocation", "mulch", "timing"]
-        self.stage_index = 0
-        self.stage_state = "idle"
         self.stage_feedback = ""
         self.stage_feedback_until = 0
-
-        # storage
         self.choices = {}
-        self.choice_buttons = []
+        self.crop_rects, self.livestock_rects = [], []
 
-        # chat assistant
-        self.chat_history = [("bot", "Hi! Ask me about crops, irrigation, or livestock for this location.")]
-        self.chat_input = ""
-        self.chat_active = False
-        self.chat_rect = pygame.Rect(self.side_rect.x + 8,
-                                     self.side_rect.bottom - 120,
-                                     self.side_rect.w - 16, 28)
+        self.crop_input, self.livestock_input = "", ""
+        self.crop_input_active, self.livestock_input_active = False, False
+        self.crop_input_rect, self.livestock_input_rect = None, None
 
-        # recommendation popup
-        self.crop_rects = []
-        self.livestock_rects = []
         self.selected_reco = None
-        self.custom_input = ""
-        self.reco_panel_rect = pygame.Rect(self.side_rect.x + 12, self.side_rect.y + 140,
-                                           self.side_rect.w - 24, 180)
+        self._popup_buttons = {}
 
-        # summary
-        self.show_summary = False
-        self.anim_until = 0
+        self.center_lat, self.center_lon = center or (28.6139, 77.2090)
+        self.zoom = zoom
+        self.is_dragging = False
+        self.drag_start = None
+        self.drag_center_px = None
 
-    # ------------------ Chat helper ------------------
-    def bot_answer(self, q):
-        q = q.lower()
-        if "drip" in q or "irrigation" in q:
-            return "Drip irrigation saves water by delivering it directly to roots."
-        if "mulch" in q:
-            return "Mulch reduces evaporation and keeps soil moist longer."
-        if "livestock" in q:
-            return "Goats need less feed than cows, making them good for dry areas."
-        if "yield" in q:
-            return "Yield depends on crop type, water use, and soil care."
-        return "Use sensors & local weather data for best decisions. (Demo answer)"
+    # 🔹 FIXED: made self method
+    def draw_wrapped_text(self, surface, text, font, color, rect, line_height=20):
+        """Draw wrapped text inside rect and return the height used."""
+        words = text.split(" ")
+        lines, current_line = [], ""
+        for word in words:
+            test_line = current_line + word + " "
+            if font.size(test_line)[0] <= rect.w - 20:  # padding
+                current_line = test_line
+            else:
+                lines.append(current_line)
+                current_line = word + " "
+        if current_line:
+            lines.append(current_line)
 
-    # ------------------ Events ------------------
+        y = rect.y
+        for line in lines:
+            line_surf = font.render(line, True, color)
+            surface.blit(line_surf, (rect.x + 10, y))
+            y += line_height
+
+        return len(lines) * line_height
+
     def handle_event(self, event):
-        if self.show_summary:
+        # Map drag & zoom
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if self.map_rect.collidepoint(event.pos):
+                self.is_dragging = True
+                self.drag_start = event.pos
+                self.drag_center_px = latlon_to_pixel(self.center_lat, self.center_lon, self.zoom)
+
+        elif event.type == pygame.MOUSEBUTTONUP:
+            self.is_dragging = False
+            self.drag_start = None
+            self.drag_center_px = None
+
+        elif event.type == pygame.MOUSEMOTION and self.is_dragging:
+            dx = event.pos[0] - self.drag_start[0]
+            dy = event.pos[1] - self.drag_start[1]
+            start_px, start_py = self.drag_center_px
+            new_px = start_px - dx
+            new_py = start_py - dy
+            self.center_lat, self.center_lon = pixel_to_latlon(new_px, new_py, self.zoom)
+
+        elif event.type == pygame.MOUSEWHEEL:
+            mouse_x, mouse_y = pygame.mouse.get_pos()
+            if self.map_rect.collidepoint((mouse_x, mouse_y)):
+                old_zoom = self.zoom
+                new_zoom = max(2, min(18, old_zoom + (1 if event.y > 0 else -1)))
+                if new_zoom != old_zoom:
+                    # Current center in pixel coords (old zoom)
+                    cx, cy = latlon_to_pixel(self.center_lat, self.center_lon, old_zoom)
+
+                    # Mouse position relative to map rect
+                    rel_x = mouse_x - self.map_rect.x
+                    rel_y = mouse_y - self.map_rect.y
+
+                    # Global pixel under cursor at old zoom
+                    cursor_global_x = cx - (self.map_rect.w / 2) + rel_x
+                    cursor_global_y = cy - (self.map_rect.h / 2) + rel_y
+
+                    # Convert that pixel to lat/lon
+                    lat_under_cursor, lon_under_cursor = pixel_to_latlon(cursor_global_x, cursor_global_y, old_zoom)
+
+                    # Convert back to pixels at new zoom
+                    new_cursor_px, new_cursor_py = latlon_to_pixel(lat_under_cursor, lon_under_cursor, new_zoom)
+
+                    # Adjust map center so that cursor stays fixed visually
+                    new_center_x = new_cursor_px - (rel_x - self.map_rect.w / 2)
+                    new_center_y = new_cursor_py - (rel_y - self.map_rect.h / 2)
+
+                    self.center_lat, self.center_lon = pixel_to_latlon(new_center_x, new_center_y, new_zoom)
+                    self.zoom = new_zoom
+
+        # Recommendation popup confirm/cancel
+        if self.selected_reco:
             if event.type == pygame.MOUSEBUTTONDOWN:
-                self.set_screen(None)
+                if self._popup_buttons["choose"].collidepoint(event.pos):
+                    kind, name = self.selected_reco
+                    self.choices[kind] = {"choice": name, "meta": "recommended"}
+                    self.stage_feedback = f"Stored recommended {kind}: {name}"
+                    self.stage_feedback_until = time.time() + 2
+                    self.selected_reco = None
+                elif self._popup_buttons["cancel"].collidepoint(event.pos):
+                    self.selected_reco = None
             return
 
+        # Crop/livestock input handling
         if event.type == pygame.MOUSEBUTTONDOWN:
-            mx, my = event.pos
+            if self.crop_input_rect and self.crop_input_rect.collidepoint(event.pos):
+                self.crop_input_active, self.livestock_input_active = True, False
+            elif self.livestock_input_rect and self.livestock_input_rect.collidepoint(event.pos):
+                self.livestock_input_active, self.crop_input_active = True, False
+            else:
+                self.crop_input_active = self.livestock_input_active = False
 
-            # clickable crop/livestock
+            if hasattr(self, "_confirm_crop_btn") and self._confirm_crop_btn.collidepoint(event.pos):
+                if self.crop_input.strip():
+                    name = self.crop_input.strip().capitalize()
+                    self.choices["crop"] = {"choice": name, "meta": "custom"}
+                    self.stage_feedback = f"The user's desired choice of crop: {name} is stored"
+                    self.stage_feedback_until = time.time() + 2
+                    self.crop_input = ""
+
+            if hasattr(self, "_confirm_livestock_btn") and self._confirm_livestock_btn.collidepoint(event.pos):
+                if self.livestock_input.strip():
+                    name = self.livestock_input.strip().capitalize()
+                    self.choices["livestock"] = {"choice": name, "meta": "custom"}
+                    self.stage_feedback = f"The user's desired choice of livestock: {name} is stored"
+                    self.stage_feedback_until = time.time() + 2
+                    self.livestock_input = ""
+
+            mx, my = event.pos
             for name, rect in self.crop_rects:
                 if rect.collidepoint((mx, my)):
                     self.selected_reco = ("crop", name)
@@ -406,269 +692,170 @@ class ExploreStageLearning:
                     self.selected_reco = ("livestock", name)
                     return
 
-            # popup buttons
-            if self.selected_reco:
-                panel = self.reco_panel_rect
-                use_btn = pygame.Rect(panel.right - 140, panel.bottom - 36, 120, 28)
-                custom_btn = pygame.Rect(panel.right - 280, panel.bottom - 36, 120, 28)
-                input_rect = pygame.Rect(panel.x + 12, panel.bottom - 70, panel.w - 24, 26)
-
-                if use_btn.collidepoint((mx, my)):
-                    kind, name = self.selected_reco
-                    self.choices[kind] = {"choice": name, "meta": {"applied_from": "recommended"}}
-                    self.stage_feedback = f"Applied recommended {kind}: {name}"
-                    self.stage_feedback_until = time.time() + 2.0
-                    self.selected_reco = None
-                    return
-                if custom_btn.collidepoint((mx, my)):
-                    if self.custom_input.strip():
-                        choice_name = self.custom_input.strip().capitalize()
-                        kind, _ = self.selected_reco
-                        self.choices[kind] = {"choice": choice_name, "meta": {"applied_from": "custom"}}
-                        self.stage_feedback = f"Applied custom {kind}: {choice_name}"
-                        self.stage_feedback_until = time.time() + 2.0
-                        self.custom_input = ""
-                        self.selected_reco = None
-                    return
-                if input_rect.collidepoint((mx, my)):
-                    self.chat_active = False  # switch focus
-                    self.custom_active = True
-                    return
-
-            # stage buttons
-            for rect, meta in self.choice_buttons:
-                if rect.collidepoint((mx, my)):
-                    self.apply_stage_choice(meta)
-                    return
-
-            # chat input/send
-            chat_send_rect = pygame.Rect(self.side_rect.right - 82, self.side_rect.bottom - 32, 62, 24)
-            chat_input_rect = pygame.Rect(self.side_rect.x + 8, self.side_rect.bottom - 32, self.side_rect.w - 90, 24)
-            if chat_input_rect.collidepoint((mx, my)):
-                self.chat_active = True
-                return
-            if chat_send_rect.collidepoint((mx, my)):
-                if self.chat_input.strip():
-                    self.chat_history.append(("user", self.chat_input.strip()))
-                    self.chat_history.append(("bot", self.bot_answer(self.chat_input.strip())))
-                    self.chat_input = ""
-                    self.chat_active = False
-                return
-
         elif event.type == pygame.KEYDOWN:
-            if self.chat_active:
-                if event.key == pygame.K_RETURN:
-                    if self.chat_input.strip():
-                        self.chat_history.append(("user", self.chat_input.strip()))
-                        self.chat_history.append(("bot", self.bot_answer(self.chat_input.strip())))
-                        self.chat_input = ""
-                        self.chat_active = False
-                elif event.key == pygame.K_BACKSPACE:
-                    self.chat_input = self.chat_input[:-1]
+            if self.crop_input_active:
+                if event.key == pygame.K_BACKSPACE:
+                    self.crop_input = self.crop_input[:-1]
                 else:
-                    self.chat_input += event.unicode
-            elif self.selected_reco:  # typing custom choice
-                if event.key == pygame.K_RETURN:
-                    if self.custom_input.strip():
-                        choice_name = self.custom_input.strip().capitalize()
-                        kind, _ = self.selected_reco
-                        self.choices[kind] = {"choice": choice_name, "meta": {"applied_from": "custom"}}
-                        self.stage_feedback = f"Applied custom {kind}: {choice_name}"
-                        self.stage_feedback_until = time.time() + 2.0
-                        self.custom_input = ""
-                        self.selected_reco = None
-                elif event.key == pygame.K_BACKSPACE:
-                    self.custom_input = self.custom_input[:-1]
+                    self.crop_input += event.unicode
+            elif self.livestock_input_active:
+                if event.key == pygame.K_BACKSPACE:
+                    self.livestock_input = self.livestock_input[:-1]
                 else:
-                    self.custom_input += event.unicode
-
-    # ------------------ Stage logic ------------------
-    def start_stage_question(self):
-        if self.stage_index >= len(self.stages):
-            self.show_summary = True
-            return
-        self.choice_buttons.clear()
-        # define choices like before
-        # (omitted here to keep it short)
-
-    def apply_stage_choice(self, meta):
-        label = meta["label"]
-        m = meta["meta"]
-        self.choices[self.stages[self.stage_index]] = {"choice": label, "meta": m}
-        self.stage_feedback = m.get("msg", "Choice applied.")
-        self.stage_feedback_until = time.time() + 2.5
-        self.stage_state = "answered"
-        self.choice_buttons.clear()
-        self.anim_until = time.time() + 2.5
-
-    def next_stage(self):
-        self.stage_index += 1
-        self.stage_state = "idle"
-        self.choice_buttons.clear()
-        if self.stage_index < len(self.stages):
-            self.start_stage_question()
-        else:
-            self.show_summary = True
+                    self.livestock_input += event.unicode
 
     def update(self, dt=1/60):
         if self.stage_feedback and time.time() > self.stage_feedback_until:
             self.stage_feedback = ""
-        if self.stage_state == "idle" and self.stage_index < len(self.stages):
-            self.start_stage_question()
-        if self.stage_state == "answered" and time.time() >= self.anim_until:
-            self.next_stage()
 
-    # ------------------ Draw ------------------
     def draw(self):
         self.screen.fill((18, 40, 22))
         draw_text(self.screen, "Explore — Stage Learning", self.title_font, (255, 255, 255), (40, 20))
+        
+        # Optional: smoother tile loading feedback in window title
+        if not _tile_cache:
+            pygame.display.set_caption("⏳ Loading map tiles...")
+        else:
+            pygame.display.set_caption("KrishiPatha — Explore Mode")
 
-        # plot
-        pygame.draw.rect(self.screen, (40, 80, 50), self.map_rect)
+        # 🔹 draw map background
+        draw_webmap(self.screen, self.map_rect, self.center_lat, self.center_lon, self.zoom)
+
+        # 🔹 draw user’s polygon on top of map
         if len(self.polygon) >= 3:
-            pygame.draw.polygon(self.screen, (60, 120, 60, 180), self.polygon)
-            pygame.draw.polygon(self.screen, (30, 160, 40), self.polygon, 3)
+            pygame.draw.polygon(self.screen, (60, 180, 60), self.polygon, 0)   # filled
+            pygame.draw.polygon(self.screen, (20, 220, 40), self.polygon, 3)   # outline
+        elif len(self.polygon) >= 2:
+            pygame.draw.lines(self.screen, (150, 210, 150), False, self.polygon, 3)
 
-        # sidebar
+        for p in self.polygon:
+            pygame.draw.circle(self.screen, (0, 200, 0), p, 5)
+
+        # 🔹 side panel background
         pygame.draw.rect(self.screen, (30, 40, 30), self.side_rect)
-
-        # Recommendations
         draw_text(self.screen, "Recommendations", self.title_font, (255, 255, 255),
-                  (self.side_rect.x + 12, self.side_rect.y + 10))
+                (self.side_rect.x + 12, self.side_rect.y + 10))
+
+        # ---------------- Crops ----------------
         self.crop_rects, self.livestock_rects = [], []
-        y = self.side_rect.y + 56
-        draw_text(self.screen, "Top crops:", self.text_font, (220, 220, 220),
-                  (self.side_rect.x + 12, y))
+        y = self.side_rect.y + 40
+        draw_text(self.screen, "Top crops (click to view explanation):", self.text_font, (220, 220, 220),
+                (self.side_rect.x + 12, y))
         for c in self.crops_reco:
-            y += 22
-            draw_text(self.screen, f"- {c['name']} ({c['water_need']})", self.small_font,
-                      (200, 200, 200), (self.side_rect.x + 18, y))
-            self.crop_rects.append((c["name"], pygame.Rect(self.side_rect.x + 14, y - 2,
-                                                           self.side_rect.w - 28, 20)))
+            y += 28
+            rect = pygame.Rect(self.side_rect.x + 14, y, self.side_rect.w - 28, 26)
+            self.crop_rects.append((c["name"], rect))
+            color = (50, 100, 50) if rect.collidepoint(pygame.mouse.get_pos()) else (40, 80, 40)
+            pygame.draw.rect(self.screen, color, rect, border_radius=4)
+            draw_text(self.screen, f"{c['name']} ({c['water_need']})", self.small_font, (230, 230, 230),
+                    (rect.x + 6, rect.y + 4))
 
-        y += 28
-        draw_text(self.screen, "Livestock:", self.text_font, (220, 220, 220),
-                  (self.side_rect.x + 12, y))
+        y += 40
+        draw_text(self.screen, "Or enter your own crop choice:", self.small_font, (200, 200, 200),
+                (self.side_rect.x + 12, y))
+        self.crop_input_rect = pygame.Rect(self.side_rect.x + 14, y + 22, self.side_rect.w - 28, 28)
+        pygame.draw.rect(self.screen, (255, 255, 255), self.crop_input_rect, border_radius=4)
+        shown = self.crop_input if (self.crop_input or self.crop_input_active) else "Type your own crop..."
+        color = (0, 0, 0) if (self.crop_input or self.crop_input_active) else (120, 120, 120)
+        draw_text(self.screen, shown, self.small_font, color, (self.crop_input_rect.x + 6, self.crop_input_rect.y + 6))
+        confirm_crop_btn = pygame.Rect(self.side_rect.x + 14, self.crop_input_rect.bottom + 8, self.side_rect.w - 28, 28)
+        pygame.draw.rect(self.screen, (30, 140, 80), confirm_crop_btn, border_radius=6)
+        center_text(self.screen, "Confirm Crop Choice", self.small_font, (255, 255, 255), confirm_crop_btn)
+        self._confirm_crop_btn = confirm_crop_btn
+
+        # ---------------- Livestock ----------------
+        y = confirm_crop_btn.bottom + 40
+        draw_text(self.screen, "Livestock (click to view explanation):", self.text_font, (220, 220, 220),
+                (self.side_rect.x + 12, y))
         for a in self.livestock_reco:
-            y += 22
-            draw_text(self.screen, f"- {a['name']} (feed: {a['feed_needs']})", self.small_font,
-                      (200, 200, 200), (self.side_rect.x + 18, y))
-            self.livestock_rects.append((a["name"], pygame.Rect(self.side_rect.x + 14, y - 2,
-                                                                self.side_rect.w - 28, 20)))
+            y += 28
+            rect = pygame.Rect(self.side_rect.x + 14, y, self.side_rect.w - 28, 26)
+            self.livestock_rects.append((a["name"], rect))
+            color = (50, 100, 50) if rect.collidepoint(pygame.mouse.get_pos()) else (40, 80, 40)
+            pygame.draw.rect(self.screen, color, rect, border_radius=4)
+            draw_text(self.screen, f"{a['name']} (feed: {a['feed_needs']})", self.small_font, (230, 230, 230),
+                    (rect.x + 6, rect.y + 4))
 
-        # Popup
+        y += 40
+        draw_text(self.screen, "Or enter your own livestock choice:", self.small_font, (200, 200, 200),
+                (self.side_rect.x + 12, y))
+        self.livestock_input_rect = pygame.Rect(self.side_rect.x + 14, y + 22, self.side_rect.w - 28, 28)
+        pygame.draw.rect(self.screen, (255, 255, 255), self.livestock_input_rect, border_radius=4)
+        shown2 = self.livestock_input if (self.livestock_input or self.livestock_input_active) else "Type your own livestock..."
+        color2 = (0, 0, 0) if (self.livestock_input or self.livestock_input_active) else (120, 120, 120)
+        draw_text(self.screen, shown2, self.small_font, color2, (self.livestock_input_rect.x + 6, self.livestock_input_rect.y + 6))
+        confirm_livestock_btn = pygame.Rect(self.side_rect.x + 14, self.livestock_input_rect.bottom + 8, self.side_rect.w - 28, 28)
+        pygame.draw.rect(self.screen, (30, 140, 80), confirm_livestock_btn, border_radius=6)
+        center_text(self.screen, "Confirm Livestock Choice", self.small_font, (255, 255, 255), confirm_livestock_btn)
+        self._confirm_livestock_btn = confirm_livestock_btn
+
+        # ---------------- Popup ----------------
         if self.selected_reco:
-            panel = self.reco_panel_rect
-            pygame.draw.rect(self.screen, (25, 35, 25), panel, border_radius=8)
-            pygame.draw.rect(self.screen, (80, 120, 80), panel, width=1, border_radius=8)
             kind, name = self.selected_reco
-            title = "Crop" if kind == "crop" else "Livestock"
-            draw_text(self.screen, f"{title}: {name}", self.text_font,
-                      (255, 255, 255), (panel.x + 12, panel.y + 8))
-            expl = self.reco_explanations.get(name) if kind == "crop" else self.livestock_explanations.get(name, "")
-            yy = panel.y + 40
-            for ln in expl.split(". "):
-                draw_text(self.screen, ln, self.small_font, (220, 220, 220), (panel.x + 12, yy))
-                yy += 16
-            # custom input
-            input_rect = pygame.Rect(panel.x + 12, panel.bottom - 70, panel.w - 24, 26)
-            pygame.draw.rect(self.screen, (255, 255, 255), input_rect, border_radius=4)
-            draw_text(self.screen, self.custom_input or "Type your own choice...", self.small_font,
-                      (0, 0, 0), (input_rect.x + 6, input_rect.y + 4))
+            explanation = (self.reco_explanations.get(name) if kind == "crop"
+                        else self.livestock_explanations.get(name, ""))
+
+            w, base_h = 420, 120
+            popup_rect = pygame.Rect(self.W//2 - w//2, self.H//2 - base_h//2, w, base_h)
+
+            # measure wrapped text height
+            text_rect = pygame.Rect(popup_rect.x + 10, popup_rect.y + 50, popup_rect.w - 20, 9999)
+            text_height = self.draw_wrapped_text(self.screen, explanation, self.small_font,
+                                                (220, 220, 220), text_rect, line_height=20)
+
+            # recalc popup rect with final height
+            total_h = min(280, 100 + text_height)
+            popup_rect = pygame.Rect(self.W//2 - w//2, self.H//2 - total_h//2, w, total_h)
+
+            # draw background
+            pygame.draw.rect(self.screen, (40, 60, 40), popup_rect, border_radius=8)
+            pygame.draw.rect(self.screen, (200, 200, 200), popup_rect, 2, border_radius=8)
+
+            # title
+            draw_text(self.screen, f"{kind.title()}: {name}", self.text_font, (255, 255, 255),
+                    (popup_rect.x + 16, popup_rect.y + 16))
+
+            # draw wrapped explanation again inside popup
+            text_rect = pygame.Rect(popup_rect.x + 10, popup_rect.y + 50, popup_rect.w - 20, popup_rect.h - 90)
+            self.draw_wrapped_text(self.screen, explanation, self.small_font, (220, 220, 220), text_rect, line_height=20)
+
             # buttons
-            use_btn = pygame.Rect(panel.right - 140, panel.bottom - 36, 120, 28)
-            custom_btn = pygame.Rect(panel.right - 280, panel.bottom - 36, 120, 28)
-            pygame.draw.rect(self.screen, (30, 140, 80), use_btn, border_radius=6)
-            center_text(self.screen, "Use recommended", self.small_font, (255, 255, 255), use_btn)
-            pygame.draw.rect(self.screen, (30, 100, 160), custom_btn, border_radius=6)
-            center_text(self.screen, "Confirm custom", self.small_font, (255, 255, 255), custom_btn)
+            choose_btn = pygame.Rect(popup_rect.x + 20, popup_rect.bottom - 50, 120, 32)
+            cancel_btn = pygame.Rect(popup_rect.right - 140, popup_rect.bottom - 50, 120, 32)
+            pygame.draw.rect(self.screen, (40, 160, 100), choose_btn, border_radius=6)
+            pygame.draw.rect(self.screen, (160, 60, 60), cancel_btn, border_radius=6)
+            center_text(self.screen, "Choose", self.small_font, (255, 255, 255), choose_btn)
+            center_text(self.screen, "Cancel", self.small_font, (255, 255, 255), cancel_btn)
 
-        # Chatbox (bottom)
-        chat_title_rect = pygame.Rect(self.side_rect.x + 8, self.side_rect.bottom - 120,
-                                      self.side_rect.w - 24, 20)
-        pygame.draw.rect(self.screen, (40, 40, 40), chat_title_rect, border_radius=6)
-        draw_text(self.screen, "AI Helper", self.small_font, (255, 255, 255),
-                  (chat_title_rect.x + 8, chat_title_rect.y + 2))
+            self._popup_buttons = {"choose": choose_btn, "cancel": cancel_btn}
 
-        self.chat_rect = pygame.Rect(self.side_rect.x + 8, self.side_rect.bottom - 32,
-                                     self.side_rect.w - 90, 24)
-        pygame.draw.rect(self.screen, (255, 255, 255), self.chat_rect, border_radius=6)
-        draw_text(self.screen, self.chat_input or "Type a question...", self.small_font,
-                  (0, 0, 0), (self.chat_rect.x + 6, self.chat_rect.y + 4))
-
-        send_btn = pygame.Rect(self.chat_rect.right + 4, self.chat_rect.y, 62, 24)
-        pygame.draw.rect(self.screen, (60, 160, 90), send_btn, border_radius=6)
-        center_text(self.screen, "Send", self.small_font, (255, 255, 255), send_btn)
-
-        # ---- Selected recommendation panel (Step 1) ----
-        if self.selected_reco:
-            panel = self.reco_panel_rect
-            pygame.draw.rect(self.screen, (20, 30, 20), panel, border_radius=8)
-            pygame.draw.rect(self.screen, (60, 60, 60), panel, width=1, border_radius=8)
-            kind, name = self.selected_reco
-            title = "Crop" if kind == "crop" else "Livestock"
-            draw_text(self.screen, f"{title}: {name}", self.text_font, (255, 255, 255), (panel.x + 10, panel.y + 8))
-            expl = self.reco_explanations.get(name) if kind == "crop" else self.livestock_explanations.get(name)
-            if not expl:
-                expl = "No explanation available."
-            # wrap text roughly
-            lines = []
-            words = expl.split(" ")
-            line = ""
-            for w in words:
-                if len(line + " " + w) > 48:
-                    lines.append(line)
-                    line = w
-                else:
-                    if line:
-                        line += " " + w
-                    else:
-                        line = w
-            if line:
-                lines.append(line)
-            yy = panel.y + 44
-            for ln in lines[:5]:
-                draw_text(self.screen, ln, self.small_font, (220, 220, 220), (panel.x + 10, yy))
-                yy += 16
-
-            # action buttons
-            use_btn = pygame.Rect(panel.right - 140, panel.bottom - 40, 120, 28)
-            close_btn = pygame.Rect(panel.right - 270, panel.bottom - 40, 120, 28)
-            pygame.draw.rect(self.screen, (30, 140, 80), use_btn, border_radius=6)
-            center_text(self.screen, "Use recommended", self.small_font, (255, 255, 255), use_btn)
-            pygame.draw.rect(self.screen, (120, 120, 120), close_btn, border_radius=6)
-            center_text(self.screen, "Close", self.small_font, (255, 255, 255), close_btn)
-
-        # summary overlay
-        if self.show_summary:
-            overlay = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 200))
-            self.screen.blit(overlay, (0, 0))
-            card = pygame.Rect(self.W//2 - 340, self.H//2 - 220, 680, 440)
-            pygame.draw.rect(self.screen, (255, 255, 255), card, border_radius=12)
-            draw_text(self.screen, "Summary — Explore Mode", self.title_font, (10, 80, 10), (card.x + 24, card.y + 14))
-            y2 = card.y + 64
-            for idx, st in enumerate(self.stages):
-                ch = self.choices.get(st, {"choice": "—"})
-                draw_text(self.screen, f"{idx+1}. {st}: {ch['choice']}", self.small_font, (0, 0, 0), (card.x + 34, y2))
-                y2 += 26
-
-    # When summary overlay is visible, clicking should return
-    def handle_summary_click(self):
-        self.set_screen(None)
+        # ---------------- Feedback ----------------
+        if self.stage_feedback:
+            feedback_surf = self.text_font.render(self.stage_feedback, True, (255, 215, 0))
+            # Position the feedback centered below the map, not on the side panel
+            feedback_x = self.map_rect.x + (self.map_rect.w - feedback_surf.get_width()) // 2
+            feedback_y = self.map_rect.bottom + 10  # just below the map
+            self.screen.blit(feedback_surf, (feedback_x, feedback_y))
 
 
 # ---------- If you want quick local run for testing ----------
 if __name__ == "__main__":
-    # Quick runner so you can run this file standalone for testing
     pygame.init()
     screen = pygame.display.set_mode((1200, 720))
     clock = pygame.time.Clock()
-    current = ExplorePage(screen, lambda s: None)  # placeholder
+    current = ExplorePage(screen, lambda s: None)
 
-    # For quick manual testing: pressing ENTER will cycle screens
-    screens_cycle = [ExplorePage(screen, lambda s: None), ExploreMap(screen, lambda s: None),
-                     ExplorePlot(screen, lambda s: None), ExploreStageLearning(screen, lambda s: None, env=SAMPLE_ENVIRONMENTS["default"], polygon=[(200,200),(400,180),(480,360)])]
+    screens_cycle = [
+        ExplorePage(screen, lambda s: None),
+        ExploreMap(screen, lambda s: None),
+        ExplorePlot(screen, lambda s: None),
+        ExploreStageLearning(
+            screen,
+            lambda s: None,
+            env=SAMPLE_ENVIRONMENTS["default"],
+            polygon=[(200, 200), (400, 180), (480, 360)]
+        )
+    ]
     idx = 0
     running = True
     while running:

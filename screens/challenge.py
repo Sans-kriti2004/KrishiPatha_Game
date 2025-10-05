@@ -81,7 +81,7 @@ class ChallengePage:
             self.screen.fill((255, 228, 181))  # fallback
 
         # Title with semi-transparent background
-        title_text = "🌾 Challenge Mode - Select a Level"
+        title_text = "🌾 Quiz Mode - Select a Level"
         title_surface = self.font.render(title_text, True, (255, 255, 255))
         title_rect = title_surface.get_rect(center=(450, 80))
 

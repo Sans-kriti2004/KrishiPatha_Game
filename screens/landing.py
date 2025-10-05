@@ -94,6 +94,6 @@ class LandingPage:
         # Challenge button
         challenge_color = (234, 179, 8) if not self.challenge_button.collidepoint(mouse_pos) else (200, 140, 0)
         pygame.draw.rect(self.screen, challenge_color, self.challenge_button, border_radius=15)
-        challenge_text = self.font.render("Challenge", True, (0, 0, 0))
+        challenge_text = self.font.render("Quiz", True, (0, 0, 0))
         challenge_rect = challenge_text.get_rect(center=self.challenge_button.center)
         self.screen.blit(challenge_text, challenge_rect)

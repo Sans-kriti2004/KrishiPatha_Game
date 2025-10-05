@@ -19,7 +19,7 @@ if not hasattr(Image, "ANTIALIAS"):
 
 
 # ---------- Backend API integration ----------
-BACKEND_URL = "http://127.0.0.1:8000/analyze/environment"
+BACKEND_URL = "https://nasa-space-app-models.onrender.com/predict"
 
 def fetch_environment_data(lat, lon):
     """
@@ -1121,21 +1121,16 @@ class ExploreSimulation:
             # send to backend for results
             try:
                 resp = requests.post(
-                    "http://127.0.0.1:8000/analyze/simulate",
+                    "https://nasa-space-app-models.onrender.com/predict",
                     json={
-                        "crop": self.crop["choice"],
-                        "livestock": self.livestock["choice"],
-                        "water_amount": self.process["water_amount"],
-                        "irrigation": self.process["irrigation"],
-                        "soil": self.env.get("soil", "loamy"),
-                        "temp": self.env.get("avg_temp", 25),
-                        "rainfall": self.env.get("avg_rainfall", 700)
+                        "date": time.strftime("%d/%m/%Y"),
+                        "city": "Delhi, India"  # or you can later link it to map location
                     },
-                    timeout=10
+                    timeout=15
                 )
                 data = resp.json() if resp.status_code == 200 else {"yield": 0, "score": 0}
             except Exception as e:
-                print("Simulation backend error:", e)
+                print("⚠️ Simulation backend error:", e)
                 data = {"yield": 0, "score": 0}
 
             self.set_screen(ExploreResults(self.screen, self.set_screen, data, self.crop, self.livestock, self.process))

@@ -6,6 +6,17 @@ import os
 import math
 import json
 import time
+try:
+    import moviepy.editor as mp
+except ModuleNotFoundError:
+    mp = None
+    print("⚠️ MoviePy not found. Simulation videos will use fallback animation.")
+from PIL import Image
+# Temporary compatibility patch for Pillow >=10
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
+
 
 # ---------- Backend API integration ----------
 BACKEND_URL = "http://127.0.0.1:8000/analyze/environment"
@@ -1078,6 +1089,12 @@ class ExploreSimulation:
         self.W, self.H = screen.get_size()
         self.title_font = pygame.font.SysFont("Arial", 28, bold=True)
         self.text_font = pygame.font.SysFont("Arial", 18)
+        
+        video_path = os.path.join("assets", "simulation.mp4")
+        if os.path.exists(video_path):
+            self.clip = mp.VideoFileClip(video_path).resize((self.W - 400, self.H - 320))
+        else:
+            self.clip = None
 
         self.start_time = time.time()
         self.sim_duration = 8  # seconds for fake loading
@@ -1127,8 +1144,14 @@ class ExploreSimulation:
         self.screen.fill((15, 35, 25))
         draw_text(self.screen, "Simulating Farming Process...", self.title_font, (255, 255, 255), (40, 30))
 
-        pygame.draw.rect(self.screen, (50, 80, 50), self.video_placeholder, border_radius=12)
-        center_text(self.screen, "Crop Growth Simulation Running...", self.text_font, (240, 240, 240), self.video_placeholder)
+        if self.clip:
+            frame = self.clip.get_frame(time.time() - self.start_time)
+            frame_surface = pygame.image.frombuffer(frame.tobytes(), frame.shape[1::-1], "RGB")
+            frame_surface = pygame.transform.scale(frame_surface, (self.video_placeholder.w, self.video_placeholder.h))
+            self.screen.blit(frame_surface, self.video_placeholder)
+        else:
+            pygame.draw.rect(self.screen, (50, 80, 50), self.video_placeholder, border_radius=12)
+            center_text(self.screen, "🎬 Crop Growth Simulation Running...", self.text_font, (240, 240, 240), self.video_placeholder)
 
         # progress bar
         bar_rect = pygame.Rect(200, self.video_placeholder.bottom + 40, self.W - 400, 30)

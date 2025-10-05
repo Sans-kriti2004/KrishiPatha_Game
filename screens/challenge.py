@@ -51,8 +51,8 @@ class ChallengePage:
             for level, rect in self.level_buttons:
                 if rect.collidepoint(event.pos):
                     if level == 1:
-                        from .levels.level1 import Level1Welcome
-                        self.set_screen(Level1Welcome(self.screen, self.set_screen))
+                        from screens.levels.level1 import Level1
+                        self.set_screen(Level1(self.screen, self.set_screen))
                     elif level == 2:
                         from screens.levels.level2 import Level2
                         self.set_screen(Level2(self.screen, self.set_screen))
